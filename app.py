@@ -9,6 +9,7 @@
     export ANTHROPIC_API_KEY="sk-ant-..."
 """
 import calendar
+import hashlib
 import html
 import json
 import os
@@ -206,17 +207,31 @@ def clean(text, limit=220):
     return text if len(text) <= limit else text[: limit - 1].rsplit(" ", 1)[0] + "…"
 
 
+FEED_ERRORS = {}   # джерело -> остання помилка
+FEED_UA = "Mozilla/5.0 (compatible; WorldNewsBot/1.0)"
+
+
+def read_feed(source, url):
+    """Завантажує одну стрічку з таймаутом, щоб одне джерело не зависало все."""
+    try:
+        r = requests.get(url, headers={"User-Agent": FEED_UA}, timeout=12)
+        r.raise_for_status()
+        FEED_ERRORS.pop(source, None)
+        return feedparser.parse(r.content).entries
+    except Exception as exc:
+        FEED_ERRORS[source] = str(exc)[:90]
+        print(f"[feed error] {source}: {exc}")
+        return []
+
+
 def fetch_section(feeds):
+    with ThreadPoolExecutor(8) as pool:
+        results = list(pool.map(lambda f: read_feed(f[0], f[1]), feeds))
     items, seen = [], set()
-    for feed in feeds:
-        source, url = feed[0], feed[1]
+    for feed, entries in zip(feeds, results):
+        source = feed[0]
         src = feed[2] if len(feed) > 2 else "en"
-        try:
-            parsed = feedparser.parse(url, agent="WorldNewsBot/1.0")
-        except Exception as exc:
-            print(f"[feed error] {source}: {exc}")
-            continue
-        for e in parsed.entries[:PER_FEED]:
+        for e in entries[:PER_FEED]:
             title = clean(e.get("title"), 160)
             link = e.get("link")
             key = re.sub(r"\W+", "", title.lower())[:60]
@@ -426,10 +441,12 @@ def start_translate(lang):
 # ---------- оновлення ----------
 
 def refresh():
-    sections = {name: fetch_section(feeds) for name, feeds in FEEDS.items()}
-    with LOCK:
-        STATE["sections"] = sections
-        STATE["updated"] = datetime.now(timezone.utc)
+    for name, feeds in FEEDS.items():
+        items = fetch_section(feeds)
+        with LOCK:
+            STATE["sections"] = {**STATE["sections"],
+                                 name: items or STATE["sections"].get(name, [])}
+            STATE["updated"] = datetime.now(timezone.utc)
     print(f"[ok] оновлено {datetime.now():%H:%M}")
     now = time.time()
     for lang, last in list(ACTIVE.items()):
@@ -578,13 +595,123 @@ def status():
     langs = {l: {"done": sum((l, n["link"]) in TR for n in items),
                  "total": len(items), "pending": l in PENDING}
              for l in list(ACTIVE)}
-    return jsonify(items=len(items), langs=langs, last_error=LAST_ERROR[0])
+    return jsonify(items=len(items), langs=langs, last_error=LAST_ERROR[0],
+                   feed_errors=FEED_ERRORS,
+                   updated=str(STATE["updated"]))
 
 
 @app.route("/api/news")
 def api():
     with LOCK:
         return jsonify(STATE["sections"])
+
+
+# ---------- Telegram-бот (працює, якщо задано змінну BOT_TOKEN) ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+BOT_SECRET = hashlib.sha256(BOT_TOKEN.encode()).hexdigest()[:24] if BOT_TOKEN else ""
+BOT_LANGS = ["uk", "ru", "en", "pl", "de", "es", "fr", "it", "tr", "ar", "zh-CN", "ja"]
+SEC_NAMES = list(FEEDS)   # порядок розділів
+
+
+def tg(method, **params):
+    if not BOT_TOKEN:
+        return None
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
+                          json=params, timeout=15)
+        return r.json()
+    except Exception as exc:
+        print(f"[telegram error] {exc}")
+        return None
+
+
+def tg_menu(lang):
+    ui = get_ui(lang)
+    names = [ui.get("sec", {}).get(n, n) for n in SEC_NAMES]
+    rows = []
+    for i in range(0, len(names), 2):
+        rows.append([{"text": names[j], "callback_data": f"n|{lang}|{j}"}
+                     for j in range(i, min(i + 2, len(names)))])
+    rows.append([{"text": "🌐 " + LANGS[lang][0], "callback_data": f"l|{lang}"}])
+    text = f"<b>{html.escape(ui['title'])}</b>\n{html.escape(ui['sub'])}"
+    return text, {"inline_keyboard": rows}
+
+
+def tg_langs():
+    rows, row = [], []
+    for code in BOT_LANGS:
+        row.append({"text": LANGS[code][0], "callback_data": f"m|{code}"})
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return "🌐 Language / Мова", {"inline_keyboard": rows}
+
+
+def tg_news(lang, idx):
+    ACTIVE[lang] = time.time()
+    start_translate(lang)
+    ui = get_ui(lang)
+    name = ui.get("sec", {}).get(SEC_NAMES[idx], SEC_NAMES[idx])
+    with LOCK:
+        items = list(STATE["sections"].get(SEC_NAMES[idx], []))[:8]
+    back = {"inline_keyboard": [[{"text": "⬅", "callback_data": f"m|{lang}"}]]}
+    if not items:
+        return html.escape(ui["wait"]), back
+    lines = []
+    for n in items:
+        title = TR.get((lang, n["link"]), (n["title"], ""))[0]
+        lines.append(f'• <a href="{html.escape(n["link"], quote=True)}">'
+                     f'{html.escape(title)}</a> <i>{html.escape(n["source"])}</i>')
+    return f"<b>{html.escape(name)}</b>\n\n" + "\n\n".join(lines), back
+
+
+def tg_handle(upd):
+    msg, cb = upd.get("message"), upd.get("callback_query")
+    if msg:
+        code = ((msg.get("from") or {}).get("language_code") or "").split("-")[0]
+        lang = code if code in LANGS else DEFAULT_LANG
+        ACTIVE[lang] = time.time()
+        start_translate(lang)
+        text, markup = tg_menu(lang)
+        tg("sendMessage", chat_id=msg["chat"]["id"], text=text, parse_mode="HTML",
+           reply_markup=markup, link_preview_options={"is_disabled": True})
+    elif cb:
+        tg("answerCallbackQuery", callback_query_id=cb["id"])
+        parts = (cb.get("data") or "").split("|")
+        kind = parts[0]
+        lang = parts[1] if len(parts) > 1 and parts[1] in LANGS else DEFAULT_LANG
+        if kind == "n" and len(parts) > 2 and parts[2].isdigit() and int(parts[2]) < len(SEC_NAMES):
+            text, markup = tg_news(lang, int(parts[2]))
+        elif kind == "l":
+            text, markup = tg_langs()
+        else:
+            ACTIVE[lang] = time.time()
+            start_translate(lang)
+            text, markup = tg_menu(lang)
+        tg("editMessageText", chat_id=cb["message"]["chat"]["id"],
+           message_id=cb["message"]["message_id"], text=text, parse_mode="HTML",
+           reply_markup=markup, link_preview_options={"is_disabled": True})
+
+
+@app.route("/tg/<secret>", methods=["POST"])
+def tg_hook(secret):
+    if not BOT_TOKEN or secret != BOT_SECRET:
+        return "no", 403
+    try:
+        tg_handle(request.get_json(force=True, silent=True) or {})
+    except Exception as exc:
+        print(f"[telegram error] {exc}")
+    return "ok"
+
+
+@app.route("/tg-setup")
+def tg_setup():
+    if not BOT_TOKEN:
+        return "Додайте змінну BOT_TOKEN у Render (Environment) і відкрийте цю сторінку ще раз.", 400
+    url = request.host_url.replace("http://", "https://") + "tg/" + BOT_SECRET
+    return jsonify(tg("setWebhook", url=url, allowed_updates=["message", "callback_query"]))
 
 
 threading.Thread(target=loop, daemon=True).start()
